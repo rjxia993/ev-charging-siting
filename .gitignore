@@ -1,0 +1,21 @@
+# generated data, rebuild with: python src/data_prep.py
+data/*.csv
+data/*.npy
+
+# notebook checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# solver scratch files
+*.lp
+*.mps
+*.sol
+
+# os
+.DS_Store
