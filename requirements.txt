@@ -1,9 +1,6 @@
-numpy>=1.24
-pandas>=2.0
-pulp>=2.7
-matplotlib>=3.7
-
-# optional, only needed to pull candidate sites live from OpenStreetMap
-# via data_prep.pull_sites_from_osm()
-# osmnx>=2.0
-# geopandas>=0.14
+numpy==2.5.2
+pandas==3.0.5
+pulp==3.3.2
+matplotlib==3.11.1
+jupyter==1.1.1
+nbconvert==7.17.0

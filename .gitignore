@@ -1,10 +1,13 @@
-# generated data, rebuild with: python src/data_prep.py
-data/*.csv
+# derived model arrays can be rebuilt with python src/data_prep.py
+data/sites.csv
+data/demands.csv
 data/*.npy
 
 # notebook checkpoints
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+**/.ipython/
+**/.matplotlib/
 
 # python
 __pycache__/

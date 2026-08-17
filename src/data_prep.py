@@ -1,181 +1,205 @@
+"""Build the Chicago EV-charging siting teaching instance.
+
+Observed source data: candidate coordinates and facility types come from the
+City of Chicago Business Licenses - Current Active snapshot (uupf-x98q).
+Demand spatial shape uses 2023 ACS community-area population density from the
+City of Chicago (t68z-cikk) and official boundaries (igwz-8jzy).
+
+Model assumptions: total demand is scaled to 23,248 units; site-specific costs
+and capacities are scenario parameters; distances are great-circle rather than
+road-network distances. These assumptions must not be described as measured EV
+sessions, engineering bids, or verified site throughput.
 """
-Build the problem instance: candidate sites, demand points, and the distance
-matrix for the EV charging station siting model (Chicago).
+from __future__ import annotations
 
-Run from the repo root:
-
-    python src/data_prep.py
-
-This writes data/sites.csv, data/demands.csv, and data/distance.npy.
-"""
+import json
 import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-# ----------------------------------------------------------------------
-# Study area: near north and west side of Chicago
-# ----------------------------------------------------------------------
 WEST, EAST = -87.72, -87.60
 SOUTH, NORTH = 41.85, 41.95
-CENTER = (-87.6298, 41.8781)      # the Loop
-
-# grid resolution for demand points
+CENTER = (-87.6298, 41.8781)
 NX, NY = 8, 7
-
-# how fast demand and land price fall off with distance from the Loop
 DECAY_KM = 4.5
-
 SEED = 42
+TARGET_TOTAL_DEMAND = 23_248
 
-# ----------------------------------------------------------------------
-# Candidate sites.
-#
-# These are real Chicago parking garages and fuel stations. They are hard
-# coded so the pipeline runs with no network access. To pull them live from
-# OpenStreetMap instead, use pull_sites_from_osm() below.
-# ----------------------------------------------------------------------
-CANDIDATES = [
-    (-87.6270, 41.8827, "parking"),   # Millennium Park garage
-    (-87.6195, 41.8853, "parking"),   # Grant Park North
-    (-87.6338, 41.8919, "parking"),   # River North
-    (-87.6410, 41.8994, "fuel"),      # Near North, Clybourn
-    (-87.6553, 41.9120, "parking"),   # Lincoln Park south
-    (-87.6722, 41.9105, "fuel"),      # Bucktown
-    (-87.6769, 41.9089, "parking"),   # Wicker Park
-    (-87.6866, 41.8956, "fuel"),      # Humboldt Park east
-    (-87.7013, 41.9033, "parking"),   # Humboldt Park
-    (-87.6644, 41.8836, "fuel"),      # West Loop
-    (-87.6520, 41.8781, "parking"),   # Greektown
-    (-87.6412, 41.8674, "fuel"),      # University Village
-    (-87.6280, 41.8598, "parking"),   # Chinatown north
-    (-87.6720, 41.8570, "fuel"),      # Pilsen
-    (-87.7085, 41.8721, "parking"),   # Lawndale
-    (-87.7136, 41.9250, "fuel"),      # Logan Square west
-    (-87.6900, 41.9290, "parking"),   # Logan Square
-    (-87.6641, 41.9455, "fuel"),      # Lakeview west
-    (-87.6480, 41.9380, "parking"),   # Lakeview
-    (-87.6350, 41.9210, "fuel"),      # Old Town
-]
+SOURCE_FILES = {
+    "candidate_licenses": "chicago_candidate_licenses_snapshot.csv",
+    "community_boundaries": "chicago_community_areas_2025.geojson",
+    "acs_population": "chicago_acs_2023_community_areas.csv",
+}
 
 
 def haversine_km(lon1, lat1, lon2, lat2):
-    """Great circle distance in km. Works with scalars or arrays.
-
-    Degrees of longitude and latitude are not the same length, so a plain
-    Euclidean distance on raw coordinates would be wrong.
-    """
-    R = 6371.0
+    """Great-circle distance in kilometres; supports scalars and arrays."""
+    earth_radius_km = 6371.0
     p1, p2 = np.radians(lat1), np.radians(lat2)
     dphi = p2 - p1
     dlam = np.radians(np.asarray(lon2) - np.asarray(lon1))
     a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlam / 2) ** 2
-    return 2 * R * np.arcsin(np.sqrt(a))
+    return 2 * earth_radius_km * np.arcsin(np.sqrt(a))
 
 
-def pull_sites_from_osm(n_sites=20, seed=SEED):
-    """Pull real parking and fuel locations from OpenStreetMap.
-
-    Needs internet and `pip install osmnx`. Returns the same columns as
-    build_sites(), so it is a drop in replacement for CANDIDATES.
-    """
-    import osmnx as ox
-
-    tags = {"amenity": ["fuel", "parking"]}
-    gdf = ox.features_from_bbox((WEST, SOUTH, EAST, NORTH), tags)
-    gdf = gdf[gdf.geometry.notna()].copy()
-    # parking lots come back as polygons, so take the centroid
-    pts = gdf.to_crs(3857).geometry.centroid.to_crs(4326)
-    out = pd.DataFrame({"lon": pts.x.values, "lat": pts.y.values,
-                        "amenity": gdf["amenity"].values})
-    out = out.sample(n_sites, random_state=seed).reset_index(drop=True)
-    out.insert(0, "site_id", [f"S{k:02d}" for k in range(len(out))])
-    return out
+def _farthest_first(frame: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Deterministically choose a geographically spread subset."""
+    frame = frame.reset_index(drop=True).copy()
+    lon = frame.longitude.to_numpy(float)
+    lat = frame.latitude.to_numpy(float)
+    start = int(np.argmin(haversine_km(CENTER[0], CENTER[1], lon, lat)))
+    chosen = [start]
+    min_dist = haversine_km(lon[start], lat[start], lon, lat)
+    while len(chosen) < min(n, len(frame)):
+        min_dist[chosen] = -1
+        nxt = int(np.argmax(min_dist))
+        chosen.append(nxt)
+        min_dist = np.minimum(min_dist, haversine_km(lon[nxt], lat[nxt], lon, lat))
+    return frame.iloc[chosen].copy()
 
 
-def build_sites(candidates=None):
-    """Candidate sites with assumed construction cost and capacity.
+def build_sites(source_csv: str | os.PathLike) -> pd.DataFrame:
+    """Select 20 real licensed facilities; attach synthetic cost/capacity."""
+    raw = pd.read_csv(source_csv)
+    raw = raw.dropna(subset=["latitude", "longitude", "license_description"])
+    raw = raw.drop_duplicates(subset=["address", "license_description"])
+    garages = _farthest_first(raw[raw.license_description == "Commercial Garage"], 14)
+    filling = _farthest_first(raw[raw.license_description == "Filling Station"], 6)
+    chosen = pd.concat([garages, filling], ignore_index=True)
+    chosen = chosen.sort_values(["latitude", "longitude"]).reset_index(drop=True)
 
-    ASSUMPTIONS (state these in the report):
-      - Construction cost decays with distance from the Loop, reflecting land
-        prices: about $210k downtown down to about $60k at the edge.
-      - Capacity is 4000 vehicles/day for parking garages, which have room for
-        more ports, and 2200 for fuel stations. Total capacity across all 20
-        sites is about 2.8x total demand, so roughly a third of the sites is
-        enough to serve the area. That is deliberate: it leaves the model a
-        real choice about WHICH sites to build, which is what the budget sweep
-        explores. If capacity is set much tighter, nearly every site has to be
-        built and the sensitivity curves go flat.
-    """
-    rows = candidates if candidates is not None else CANDIDATES
-    sites = pd.DataFrame(rows, columns=["lon", "lat", "amenity"])
-    sites.insert(0, "site_id", [f"S{k:02d}" for k in range(len(sites))])
+    sites = pd.DataFrame({
+        "site_id": [f"S{k:02d}" for k in range(len(chosen))],
+        "source_license_number": chosen.license_number.astype(str),
+        "name": chosen.doing_business_as_name.fillna(chosen.legal_name).astype(str),
+        "address": chosen.address.astype(str),
+        "lon": chosen.longitude.astype(float),
+        "lat": chosen.latitude.astype(float),
+        "amenity": np.where(
+            chosen.license_description.eq("Commercial Garage"), "parking", "fuel"
+        ),
+        "source_type": chosen.license_description.astype(str),
+    })
 
-    d = haversine_km(CENTER[0], CENTER[1], sites["lon"].values, sites["lat"].values)
-    sites["cost"] = np.round(60_000 + 150_000 * np.exp(-d / DECAY_KM), -3).astype(int)
-    sites["capacity"] = np.where(sites["amenity"] == "parking", 4000, 2200)
+    distance_from_loop = haversine_km(
+        CENTER[0], CENTER[1], sites.lon.to_numpy(), sites.lat.to_numpy()
+    )
+    # Assumed multi-port site cost proxy; these are not observed bids.
+    sites["cost"] = np.round(
+        60_000 + 150_000 * np.exp(-distance_from_loop / DECAY_KM), -3
+    ).astype(int)
+    # Synthetic service-capacity units, deliberately stress-tested later.
+    sites["capacity"] = np.where(sites.amenity.eq("parking"), 4000, 2200)
     return sites
 
 
-def build_demands(seed=SEED):
-    """Demand points on a grid, with an assumed demand weight.
+def _point_in_ring(lon: float, lat: float, ring) -> bool:
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > lat) != (yj > lat):
+            x_at_lat = (xj - xi) * (lat - yi) / (yj - yi) + xi
+            if lon < x_at_lat:
+                inside = not inside
+        j = i
+    return inside
 
-    ASSUMPTION: the weight stands for EV drivers per day in that grid cell. It
-    decays with distance from the Loop, since density and daytime population
-    are highest downtown. Range is about 900 near the Loop down to about 120 at
-    the edge, with 15 percent noise so cells are not identical.
-    """
-    rng = np.random.default_rng(seed)
+
+def _point_in_geometry(lon: float, lat: float, geometry: dict) -> bool:
+    polygons = geometry["coordinates"]
+    if geometry["type"] == "Polygon":
+        polygons = [polygons]
+    for polygon in polygons:
+        if not polygon or not _point_in_ring(lon, lat, polygon[0]):
+            continue
+        if any(_point_in_ring(lon, lat, hole) for hole in polygon[1:]):
+            continue
+        return True
+    return False
+
+
+def build_demands(boundaries_geojson: str | os.PathLike,
+                  acs_csv: str | os.PathLike) -> pd.DataFrame:
+    """Build 56 grid points with ACS population-density proxy weights."""
+    with open(boundaries_geojson, encoding="utf-8") as stream:
+        geo = json.load(stream)
+    acs = pd.read_csv(acs_csv)
+    acs["community_key"] = acs.community_area.str.upper().str.strip()
+    population = acs.set_index("community_key").total_population.to_dict()
+
     gx = np.linspace(WEST + 0.006, EAST - 0.006, NX)
     gy = np.linspace(SOUTH + 0.006, NORTH - 0.006, NY)
-    XX, YY = np.meshgrid(gx, gy)
+    xx, yy = np.meshgrid(gx, gy)
+    rows = []
+    for k, (lon, lat) in enumerate(zip(xx.ravel(), yy.ravel())):
+        match = next((feature for feature in geo["features"]
+                      if _point_in_geometry(float(lon), float(lat), feature["geometry"])), None)
+        # The rectangular study box includes a few cells in Lake Michigan.
+        # Clip those cells to the official City boundary instead of inventing
+        # demand outside a Chicago community area.
+        if match is None:
+            continue
+        props = match["properties"]
+        community = str(props["community"]).upper().strip()
+        pop = float(population[community])
+        area = float(props["shape_area"])
+        rows.append((f"D{k:02d}", lon, lat, community, pop, pop / area))
 
-    demands = pd.DataFrame({"lon": XX.ravel(), "lat": YY.ravel()})
-    demands.insert(0, "demand_id", [f"D{k:02d}" for k in range(len(demands))])
-
-    d = haversine_km(CENTER[0], CENTER[1], demands["lon"].values, demands["lat"].values)
-    demands["weight"] = np.round(
-        (120 + 780 * np.exp(-d / DECAY_KM)) * rng.uniform(0.85, 1.15, len(demands))
-    ).astype(int)
+    demands = pd.DataFrame(rows, columns=[
+        "demand_id", "lon", "lat", "community_area", "acs_population", "density_proxy"
+    ])
+    scaled = demands.density_proxy / demands.density_proxy.sum() * TARGET_TOTAL_DEMAND
+    weights = pd.Series(np.maximum(1, np.floor(scaled).astype(int)))
+    remainder = TARGET_TOTAL_DEMAND - int(weights.sum())
+    order = np.argsort(-(scaled - np.floor(scaled)).to_numpy())
+    weights.iloc[order[:remainder]] += 1
+    demands["weight"] = weights.to_numpy(int)
     return demands
 
 
-def build_distance_matrix(demands, sites):
-    """D[i, j] = km from demand point i to candidate site j."""
-    D = np.zeros((len(demands), len(sites)))
+def build_distance_matrix(demands: pd.DataFrame, sites: pd.DataFrame) -> np.ndarray:
+    matrix = np.zeros((len(demands), len(sites)))
     for i in range(len(demands)):
-        D[i, :] = haversine_km(demands.lon.iloc[i], demands.lat.iloc[i],
-                               sites["lon"].values, sites["lat"].values)
-    return D
+        matrix[i, :] = haversine_km(
+            demands.lon.iloc[i], demands.lat.iloc[i], sites.lon.to_numpy(), sites.lat.to_numpy()
+        )
+    return matrix
 
 
 def build_all(data_dir="data", save=True):
-    """Build everything and optionally write it to disk."""
-    sites = build_sites()
-    demands = build_demands()
-    D = build_distance_matrix(demands, sites)
+    data_dir = Path(data_dir)
+    sites = build_sites(data_dir / SOURCE_FILES["candidate_licenses"])
+    demands = build_demands(
+        data_dir / SOURCE_FILES["community_boundaries"],
+        data_dir / SOURCE_FILES["acs_population"],
+    )
+    distances = build_distance_matrix(demands, sites)
     if save:
-        os.makedirs(data_dir, exist_ok=True)
-        sites.to_csv(os.path.join(data_dir, "sites.csv"), index=False)
-        demands.to_csv(os.path.join(data_dir, "demands.csv"), index=False)
-        np.save(os.path.join(data_dir, "distance.npy"), D)
-    return sites, demands, D
+        data_dir.mkdir(parents=True, exist_ok=True)
+        sites.to_csv(data_dir / "sites.csv", index=False)
+        demands.to_csv(data_dir / "demands.csv", index=False)
+        np.save(data_dir / "distance.npy", distances)
+    return sites, demands, distances
 
 
 def load_all(data_dir="data"):
-    """Load a previously built instance."""
-    sites = pd.read_csv(os.path.join(data_dir, "sites.csv"))
-    demands = pd.read_csv(os.path.join(data_dir, "demands.csv"))
-    D = np.load(os.path.join(data_dir, "distance.npy"))
-    return sites, demands, D
+    data_dir = Path(data_dir)
+    return (
+        pd.read_csv(data_dir / "sites.csv"),
+        pd.read_csv(data_dir / "demands.csv"),
+        np.load(data_dir / "distance.npy"),
+    )
 
 
 if __name__ == "__main__":
-    sites, demands, D = build_all()
-    print(f"candidate sites  : {len(sites)}")
-    print(f"demand points    : {len(demands)}")
-    print(f"distance matrix  : {D.shape}, {D.min():.2f} to {D.max():.2f} km")
-    print(f"total demand     : {demands['weight'].sum():,}")
-    print(f"total capacity   : {sites['capacity'].sum():,}")
-    print(f"cost range       : ${sites['cost'].min():,} to ${sites['cost'].max():,}")
-    print(f"cost to build all: ${sites['cost'].sum():,}")
-    print("\nwrote data/sites.csv, data/demands.csv, data/distance.npy")
+    sites, demands, distances = build_all()
+    print(f"candidate sites  : {len(sites)} (City license records)")
+    print(f"demand points    : {len(demands)} (ACS density proxy; scaled total)")
+    print(f"distance matrix  : {distances.shape}, {distances.min():.2f}-{distances.max():.2f} km")
+    print(f"total demand     : {demands.weight.sum():,} synthetic model units")
+    print(f"total capacity   : {sites.capacity.sum():,} synthetic model units")
+    print(f"cost to build all: ${sites.cost.sum():,} assumed")
